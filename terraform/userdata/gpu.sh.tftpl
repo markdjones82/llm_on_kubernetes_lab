@@ -1,0 +1,126 @@
+#!/bin/bash
+set -e
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Set hostname
+hostnamectl set-hostname ${hostname}
+
+# ---------------------------------------------------------------------------
+# Ubuntu 24.04 LTS (Noble) GPU node setup for kubeadm clusters.
+# Installs: containerd.io (Docker repo), kubeadm/kubelet/kubectl (k8s apt repo),
+# helm. NVIDIA drivers + toolkit managed by GPU Operator post-cluster-init.
+# cgroup v2 + systemd driver — no extra kubelet config needed.
+# ---------------------------------------------------------------------------
+
+apt-get update -y
+apt-get install -y \
+  apt-transport-https \
+  ca-certificates \
+  curl \
+  gnupg \
+  bash-completion \
+  git \
+  iproute2 \
+  socat \
+  conntrack \
+  ipset
+
+# ---------------------------------------------------------------------------
+# Kernel modules required by containerd / kubeadm
+# ---------------------------------------------------------------------------
+cat <<'EOF' > /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+nf_conntrack
+EOF
+modprobe overlay
+modprobe br_netfilter
+modprobe nf_conntrack
+
+cat <<'EOF' > /etc/sysctl.d/99-kubernetes-cri.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system
+
+# ---------------------------------------------------------------------------
+# Disable swap (required by kubelet)
+# ---------------------------------------------------------------------------
+swapoff -a
+sed -i.bak -r '/\s+swap\s+/s/^/#/' /etc/fstab
+
+# ---------------------------------------------------------------------------
+# containerd.io — from Docker's apt repo; includes systemd unit and runc
+# ---------------------------------------------------------------------------
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt-get update -y
+apt-get install -y containerd.io
+
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sed -i 's|sandbox_image = "registry.k8s.io/pause:[^"]*"|sandbox_image = "registry.k8s.io/pause:3.10"|' /etc/containerd/config.toml
+# Ensure CRI plugin is not disabled (Ubuntu containerd package sets this)
+sed -i '/^\s*disabled_plugins\s*=.*"cri"/d' /etc/containerd/config.toml
+
+systemctl enable --now containerd
+
+# ---------------------------------------------------------------------------
+# kubeadm / kubelet / kubectl — from the official Kubernetes apt repo
+# ---------------------------------------------------------------------------
+K8S_MINOR="${k8s_version}"
+
+mkdir -p /etc/apt/keyrings
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/v$${K8S_MINOR}/deb/Release.key" \
+  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+https://pkgs.k8s.io/core:/stable:/v$${K8S_MINOR}/deb/ /" \
+  > /etc/apt/sources.list.d/kubernetes.list
+
+apt-get update -y
+apt-get install -y kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+
+systemctl enable --now kubelet
+
+# ---------------------------------------------------------------------------
+# kubectl bash completion + alias
+# ---------------------------------------------------------------------------
+kubectl completion bash > /etc/bash_completion.d/kubectl
+
+cat <<'EOF' > /etc/profile.d/k8s.sh
+#!/bin/bash
+alias k=kubectl
+if [ -f /etc/bash_completion.d/kubectl ]; then
+  . /etc/bash_completion.d/kubectl 2>/dev/null || true
+  complete -o default -F __start_kubectl k 2>/dev/null || true
+fi
+EOF
+chmod 644 /etc/profile.d/k8s.sh
+
+# ---------------------------------------------------------------------------
+# Helm
+# ---------------------------------------------------------------------------
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+echo "GPU node ${hostname} provisioning complete."
+# ---------------------------------------------------------------------------
+# After cluster is up, install NVIDIA GPU Operator via Helm.
+# The operator will manage drivers, toolkit, and device plugin automatically.
+#
+#   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+#   helm repo update
+#   helm install gpu-operator nvidia/gpu-operator \
+#     --namespace gpu-operator --create-namespace
+#
+# Ref: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/getting-started.html
+# ---------------------------------------------------------------------------
