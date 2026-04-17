@@ -3,9 +3,6 @@
 Terraform scaffolding for a small Kubernetes + GPU lab that runs inside an
 **existing AWS VPC and subnet**.
 
-This generic copy removes account-specific values and uses **local Terraform
-state** by default.
-
 ---
 
 ## Alternative Setup: Without AWS
